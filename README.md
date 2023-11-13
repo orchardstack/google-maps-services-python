@@ -28,6 +28,9 @@ APIs:
  - Maps Static API
  - Address Validation API
 
+This fork adds limited support for the Routes API for directions and distance matrix. Backwards compatibility
+with the existing Directions API and Distance Matrix API is maintained.
+
 Keep in mind that the same [terms and conditions](https://developers.google.com/maps/terms) apply
 to usage of the APIs when they're accessed through this library.
 

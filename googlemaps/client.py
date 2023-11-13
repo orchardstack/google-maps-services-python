@@ -28,6 +28,7 @@ from datetime import timedelta
 import functools
 import hashlib
 import hmac
+import json
 import re
 import requests
 import random
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 _X_GOOG_MAPS_EXPERIENCE_ID = "X-Goog-Maps-Experience-ID"
 _USER_AGENT = "GoogleGeoApiClientPython/%s" % googlemaps.__version__
 _DEFAULT_BASE_URL = "https://maps.googleapis.com"
+_ROUTES_BASE_URL = "https://routes.googleapis.com"
 
 _RETRIABLE_STATUSES = {500, 503, 504}
 
@@ -60,7 +62,8 @@ class Client:
                  queries_per_second=60, queries_per_minute=6000,channel=None,
                  retry_over_query_limit=True, experience_id=None, 
                  requests_session=None,
-                 base_url=_DEFAULT_BASE_URL):
+                 base_url=_DEFAULT_BASE_URL,
+                 routes_base_url=_ROUTES_BASE_URL):
         """
         :param key: Maps API key. Required, unless "client_id" and
             "client_secret" are set. Most users should use an API key.
@@ -200,6 +203,7 @@ class Client:
         self.sent_times = collections.deque("", self.queries_quota)
         self.set_experience_id(experience_id)
         self.base_url = base_url
+        self.routes_base_url = routes_base_url
 
     def set_experience_id(self, *experience_id_args):
         """Sets the value for the HTTP header field name
@@ -349,6 +353,120 @@ class Client:
                                  retry_counter + 1, base_url, accepts_clientid,
                                  extract_body, requests_kwargs, post_json)
 
+    def _routes_request(self, url, post_body, first_request_time=None, retry_counter=0,
+                        base_url=None, accepts_clientid=True, field_mask="*",
+                        extract_body=None, requests_kwargs=None):
+        """Performs HTTP GET/POST with credentials, returning the body as
+        JSON.
+
+        :param url: URL path for the request. Should begin with a slash.
+        :type url: string
+
+        :param params: HTTP GET parameters.
+        :type params: dict or list of key/value tuples
+
+        :param first_request_time: The time of the first request (None if no
+            retries have occurred).
+        :type first_request_time: datetime.datetime
+
+        :param retry_counter: The number of this retry, or zero for first attempt.
+        :type retry_counter: int
+
+        :param base_url: The base URL for the request. Defaults to the Maps API
+            server. Should not have a trailing slash.
+        :type base_url: string
+
+        :param accepts_clientid: Whether this call supports the client/signature
+            params. Some APIs require API keys (e.g. Roads).
+        :type accepts_clientid: bool
+
+        :param extract_body: A function that extracts the body from the request.
+            If the request was not successful, the function should raise a
+            googlemaps.HTTPError or googlemaps.ApiError as appropriate.
+        :type extract_body: function
+
+        :param requests_kwargs: Same extra keywords arg for requests as per
+            __init__, but provided here to allow overriding internally on a
+            per-request basis.
+        :type requests_kwargs: dict
+
+        :raises ApiError: when the API returns an error.
+        :raises Timeout: if the request timed out.
+        :raises TransportError: when something went wrong while trying to
+            exceute a request.
+        """
+
+        if base_url is None:
+            base_url = self.routes_base_url
+
+        if not first_request_time:
+            first_request_time = datetime.now()
+
+        elapsed = datetime.now() - first_request_time
+        if elapsed > self.retry_timeout:
+            raise googlemaps.exceptions.Timeout()
+
+        if retry_counter > 0:
+            # 0.5 * (1.5 ^ i) is an increased sleep time of 1.5x per iteration,
+            # starting at 0.5s when retry_counter=0. The first retry will occur
+            # at 1, so subtract that first.
+            delay_seconds = 0.5 * 1.5 ** (retry_counter - 1)
+
+            # Jitter this value by 50% and pause.
+            time.sleep(delay_seconds * (random.random() + 0.5))
+
+        authed_url = url
+
+        # Default to the client-level self.requests_kwargs, with method-level
+        # requests_kwargs arg overriding.
+        requests_kwargs = requests_kwargs or {}
+        final_requests_kwargs = dict(self.requests_kwargs, **requests_kwargs)
+
+        requests_method = self.session.post
+        final_requests_kwargs["headers"]["Content-Type"] = 'application/json'
+        final_requests_kwargs["headers"]["X-Goog-Api-Key"] = self.key
+        final_requests_kwargs["headers"]["X-Goog-FieldMask"] = field_mask
+
+        request_body_json = json.dumps(post_body)
+
+        try:
+            response = requests_method(base_url + authed_url, data=request_body_json,
+                                       **final_requests_kwargs)
+        except requests.exceptions.Timeout:
+            raise googlemaps.exceptions.Timeout()
+        except Exception as e:
+            raise googlemaps.exceptions.TransportError(e)
+
+        if response.status_code in _RETRIABLE_STATUSES:
+            # Retry request.
+            return self._routes_request(url, post_body, first_request_time,
+                                 retry_counter + 1, base_url, accepts_clientid,
+                                 field_mask, extract_body, requests_kwargs)
+
+        # Check if the time of the nth previous query (where n is
+        # queries_per_second) is under a second ago - if so, sleep for
+        # the difference.
+        if self.sent_times and len(self.sent_times) == self.queries_quota:
+            elapsed_since_earliest = time.time() - self.sent_times[0]
+            if elapsed_since_earliest < 1:
+                time.sleep(1 - elapsed_since_earliest)
+
+        try:
+            if extract_body:
+                result = extract_body(response)
+            else:
+                result = self._routes_get_body(response)
+            self.sent_times.append(time.time())
+            return result
+        except googlemaps.exceptions._RetriableRequest as e:
+            if isinstance(e, googlemaps.exceptions._OverQueryLimit) and not self.retry_over_query_limit:
+                raise
+
+            # Retry request.
+            return self._request(url, post_body, first_request_time,
+                                 retry_counter + 1, base_url, accepts_clientid,
+                                 field_mask, extract_body, requests_kwargs)
+
     def _get(self, *args, **kwargs):  # Backwards compatibility.
         return self._request(*args, **kwargs)
 
@@ -368,6 +486,13 @@ class Client:
 
         raise googlemaps.exceptions.ApiError(api_status,
                                              body.get("error_message"))
+
+    def _routes_get_body(self, response):
+        if response.status_code != 200:
+            raise googlemaps.exceptions.HTTPError(response.status_code)
+
+        body = response.json()
+        return body
 
     def _generate_auth_url(self, path, params, accepts_clientid):
         """Returns the path and query string portion of the request URL, first
@@ -428,6 +553,8 @@ from googlemaps.places import places_autocomplete
 from googlemaps.places import places_autocomplete_query
 from googlemaps.maps import static_map
 from googlemaps.addressvalidation import addressvalidation
+from googlemaps.routes import routes
+from googlemaps.route_matrix import route_matrix
 
 def make_api_method(func):
     """
@@ -472,6 +599,8 @@ Client.places_autocomplete = make_api_method(places_autocomplete)
 Client.places_autocomplete_query = make_api_method(places_autocomplete_query)
 Client.static_map = make_api_method(static_map)
 Client.addressvalidation = make_api_method(addressvalidation)
+Client.routes = make_api_method(routes)
+Client.route_matrix = make_api_method(route_matrix)
 
 
 def sign_hmac(secret, payload):
